@@ -8,7 +8,7 @@ differential testing against a reference implementation, and measured latency.
 | Concern | Approach | Cost |
 |---|---|---|
 | Price levels | `std::map` per side, ordered so `begin()` is always the best price | O(log P) to reach a new level, O(1) for the best |
-| Orders within a level | Intrusive doubly-linked FIFO over a slab-allocated pool | O(1) append, O(1) unlink |
+| Orders within a level | Intrusive doubly-linked FIFO over a pre-allocated pool | O(1) append, O(1) unlink |
 | Order lookup | `unordered_map<OrderId, slot>` | O(1) cancel and replace |
 | Allocation | Free-list over a pre-sized pool, no per-order `new` | no allocation on the hot path |
 
@@ -17,12 +17,12 @@ path, so a price either crosses or it does not, with no tolerance question.
 
 Supported: limit and market orders, GTC, IOC and FOK, cancel, and cancel-replace.
 Trades execute at the resting order's price, so the passive side's limit is
-honoured. A replace re-enters as a new order and loses time priority, which
+honored. A replace re-enters as a new order and loses time priority, which
 matches how exchanges treat a price or quantity change.
 
 ## Correctness
 
-Unit tests cover the behaviours individually. The interesting part is
+Unit tests cover the behaviors individually. The interesting part is
 `tests/test_differential.cpp`, which runs random operation sequences through
 both the real book and a deliberately naive reference model in
 `tests/reference_book.hpp`, and compares the full event stream plus the depth at
@@ -84,8 +84,8 @@ Deliberately out of scope, and worth stating rather than leaving to be found:
 - No iceberg or stop orders, no auctions, no market-data snapshot recovery.
 - `std::map` was chosen over a flat price ladder for correctness at arbitrary
   prices. A ladder indexed by tick would remove the O(log P) level lookup and
-  is the obvious next optimisation for a bounded price band.
+  is the obvious next optimization for a bounded price band.
 
-## Licence
+## License
 
 MIT

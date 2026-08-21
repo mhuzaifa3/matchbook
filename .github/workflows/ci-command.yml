@@ -1,0 +1,126 @@
+name: CI command
+
+# Runs the test suite against a pull request only when someone with write
+# access comments "/ci" on it.
+#
+# Two things make this safe to point at unreviewed code:
+#   - The command is authorized against the collaborator permission API, not
+#     against the comment author's label, so a drive-by comment does nothing.
+#   - This file and ci.yml are always read from the default branch, because
+#     issue_comment events run there. A pull request cannot edit the workflow
+#     that tests it.
+#
+# The checked-out tree is still the contributor's, and installing it runs their
+# code. That is why the write-access gate above is the security boundary: only
+# trigger a run once you have read the diff.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  authorize:
+    # Cheap filter first: pull request comments only, from someone already
+    # associated with the repository. The API check below is the real gate.
+    if: >-
+      github.event.issue.pull_request != null &&
+      startsWith(github.event.comment.body, '/ci') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+      statuses: write
+    outputs:
+      authorized: ${{ steps.gate.outputs.authorized }}
+      ref: ${{ steps.pr.outputs.ref }}
+      sha: ${{ steps.pr.outputs.sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.issue.number }}
+      COMMENTER: ${{ github.event.comment.user.login }}
+      COMMENT_ID: ${{ github.event.comment.id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Confirm the comment is exactly the /ci command
+        id: command
+        run: |
+          body=$(jq -r '.comment.body' "$GITHUB_EVENT_PATH" | tr -d '\r')
+          first=$(printf '%s\n' "$body" | head -n 1 | xargs || true)
+          if [ "$first" = "/ci" ]; then
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "comment starts with /ci but is not the command: $first"
+            echo "matched=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check the commenter has write access
+        id: gate
+        if: steps.command.outputs.matched == 'true'
+        run: |
+          level=$(gh api "repos/$REPO/collaborators/$COMMENTER/permission" --jq .permission 2>/dev/null || echo none)
+          echo "$COMMENTER has permission: $level"
+          case "$level" in
+            admin|write|maintain) echo "authorized=true" >> "$GITHUB_OUTPUT" ;;
+            *)                    echo "authorized=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Acknowledge the command
+        if: steps.command.outputs.matched == 'true'
+        continue-on-error: true
+        run: |
+          reaction=$([ "${{ steps.gate.outputs.authorized }}" = "true" ] && echo eyes || echo "-1")
+          gh api -X POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content="$reaction"
+
+      - name: Resolve the pull request head
+        id: pr
+        if: steps.gate.outputs.authorized == 'true'
+        run: |
+          sha=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "ref=refs/pull/$PR/merge" >> "$GITHUB_OUTPUT"
+
+      - name: Mark the ci check pending
+        if: steps.gate.outputs.authorized == 'true'
+        run: |
+          gh api -X POST "repos/$REPO/statuses/${{ steps.pr.outputs.sha }}" \
+            -f state=pending \
+            -f context=ci \
+            -f description="Requested by $COMMENTER" \
+            -f target_url="$RUN_URL"
+
+  test:
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
+    permissions:
+      contents: read
+    # Resolved from the default branch, not from the pull request.
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.authorize.outputs.ref }}
+
+  report:
+    needs: [authorize, test]
+    if: always() && needs.authorize.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Report the result as the ci check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "${{ needs.test.result }}" in
+            success)   state=success; text="Lint and tests passed" ;;
+            cancelled) state=error;   text="Run was cancelled" ;;
+            *)         state=failure; text="Lint or tests failed" ;;
+          esac
+          gh api -X POST "repos/${{ github.repository }}/statuses/${{ needs.authorize.outputs.sha }}" \
+            -f state="$state" \
+            -f context=ci \
+            -f description="$text" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

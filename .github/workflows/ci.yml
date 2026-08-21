@@ -1,18 +1,37 @@
 name: CI
 
+# Runs on main, and on demand from ci-command.yml when a maintainer comments
+# "/ci" on a pull request. There is deliberately no `pull_request` trigger:
+# an unreviewed contribution must not be able to execute anything here.
+
 on:
   push:
     branches: [main]
-  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Ref to check out. Defaults to the triggering ref.
+        type: string
+        required: false
+
+permissions:
+  contents: read
 
 jobs:
   build-and-test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          # The checked-out tree may be an unmerged contribution, so the job
+          # must not carry a credential it could exfiltrate.
+          persist-credentials: false
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
@@ -24,6 +43,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
       - name: Configure with ASan and UBSan
         run: >
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug

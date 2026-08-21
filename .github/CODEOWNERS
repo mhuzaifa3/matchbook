@@ -1,0 +1,9 @@
+# Every change needs review from the owner before it can land on main.
+# The workflows and the matching path are called out separately so the
+# requirement survives any future narrowing of the catch-all rule above them.
+
+*                       @mhuzaifa3
+/.github/               @mhuzaifa3
+/include/matchbook/     @mhuzaifa3
+/src/                   @mhuzaifa3
+/tests/                 @mhuzaifa3

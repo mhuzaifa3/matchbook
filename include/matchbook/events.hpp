@@ -29,7 +29,7 @@ struct Rejected {
 };
 
 // Emitted once per match. `price` is the resting order's price, which is the
-// convention that makes the passive side's limit honoured.
+// convention that makes the passive side's limit honored.
 struct Trade {
     OrderId taker{};
     OrderId maker{};
