@@ -16,21 +16,21 @@ Prices are integer ticks. There is no floating point anywhere in the matching
 path, so a price either crosses or it does not, with no tolerance question.
 
 Supported: limit and market orders, GTC, IOC and FOK, cancel, and cancel-replace.
-Trades execute at the resting order's price, so the passive side's limit is
-honored. A replace re-enters as a new order and loses time priority, which
+Trades execute at the resting order's price, which honors the passive side's
+limit. A replace re-enters as a new order and loses time priority, which
 matches how exchanges treat a price or quantity change.
 
 ## Correctness
 
-Unit tests cover the behaviors individually. The interesting part is
-`tests/test_differential.cpp`, which runs random operation sequences through
-both the real book and a deliberately naive reference model in
+Unit tests cover the behaviors individually. The differential test in
+`tests/test_differential.cpp` runs random operation sequences through both the
+real book and a deliberately naive reference model in
 `tests/reference_book.hpp`, and compares the full event stream plus the depth at
 every price after every single operation.
 
-The reference is a flat vector scanned linearly for the best eligible order. It
-is far too slow to use, and obviously correct by inspection, which is exactly
-what makes it a useful oracle. A divergence is reported at the operation that
+The reference is a flat vector the test scans end to end for the best eligible
+order. It is far too slow to use, and correct by inspection, which is what makes
+it a useful oracle. The harness reports a divergence at the operation that
 caused it rather than at the end of the run.
 
 Current coverage: 210 seeds, including ten sequences of 5,000 operations each,
@@ -47,8 +47,8 @@ Apple M3, single thread, release build, 1,000,000 operations per case:
 | submit, crossing | 6.2M ops/sec | 125ns | 458ns | 792ns |
 | cancel, random order | 2.6M ops/sec | 375ns | 792ns | 3.1us |
 
-Percentiles are reported rather than the maximum. Across repeated runs p50 to
-p99.9 are stable within a few percent, while the maximum swings between 30us
+The table reports percentiles rather than the maximum. Across repeated runs p50
+to p99.9 are stable within a few percent, while the maximum swings between 30us
 and 800us depending on when the scheduler preempts the process. On an unpinned
 laptop the maximum measures the operating system, not the book.
 
@@ -76,15 +76,15 @@ so the build stays hermetic and CI needs no network.
 
 ## Limitations
 
-Deliberately out of scope, and worth stating rather than leaving to be found:
+Out of scope by choice, and worth stating rather than leaving you to find them:
 
 - Single threaded. Concurrency in a matching engine is a design decision about
   the whole system, not a lock to add to a book.
 - No self-trade prevention. A participant can trade with their own resting order.
 - No iceberg or stop orders, no auctions, no market-data snapshot recovery.
-- `std::map` was chosen over a flat price ladder for correctness at arbitrary
-  prices. A ladder indexed by tick would remove the O(log P) level lookup and
-  is the obvious next optimization for a bounded price band.
+- The book uses `std::map` rather than a flat price ladder for correctness at
+  arbitrary prices. A ladder indexed by tick would remove the O(log P) level
+  lookup and is the obvious next optimization for a bounded price band.
 
 ## License
 
