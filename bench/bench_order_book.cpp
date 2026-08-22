@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "matchbook/order_book.hpp"
@@ -11,94 +12,151 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-struct Percentiles {
-    double p50, p99, p999, max;
-};
+constexpr std::size_t kOps = 1'000'000;
+constexpr std::size_t kBatch = 32;
 
-Percentiles percentiles(std::vector<double>& samples) {
-    std::sort(samples.begin(), samples.end());
-    const auto at = [&](double q) {
-        const auto index = static_cast<std::size_t>(q * static_cast<double>(samples.size() - 1));
-        return samples[index];
-    };
-    return {at(0.50), at(0.99), at(0.999), samples.back()};
+double nanos(Clock::duration d) { return std::chrono::duration<double, std::nano>(d).count(); }
+
+// Smallest nonzero gap two back-to-back clock reads can report. On Apple
+// silicon that is one tick of the 24MHz timebase, 41.667ns, which is the same
+// order as a single submit. Timing one operation at a time would report the
+// tick rather than the book, so every measurement below is built around this.
+double tick() {
+    double smallest = 1e9;
+    for (int i = 0; i < 100'000; ++i) {
+        const auto a = Clock::now();
+        const auto b = Clock::now();
+        const double d = nanos(b - a);
+        if (d > 0 && d < smallest) smallest = d;
+    }
+    return smallest;
 }
 
-void report(const char* name, std::vector<double>& latencies, double seconds, std::size_t ops) {
-    const Percentiles p = percentiles(latencies);
-    std::printf("%-22s %10.0f ops/sec   p50 %6.0fns  p99 %7.0fns  p99.9 %8.0fns  max %9.0fns\n",
-                name, static_cast<double>(ops) / seconds, p.p50, p.p99, p.p999, p.max);
+struct Stats {
+    double p50, p99, p999;
+};
+
+Stats percentiles(std::vector<double>& samples) {
+    std::sort(samples.begin(), samples.end());
+    const auto at = [&](double q) {
+        return samples[static_cast<std::size_t>(q * static_cast<double>(samples.size() - 1))];
+    };
+    return {at(0.50), at(0.99), at(0.999)};
+}
+
+std::string scaled(double ns) {
+    char buffer[32];
+    if (ns < 1e3) {
+        std::snprintf(buffer, sizeof buffer, "%.0fns", ns);
+    } else if (ns < 1e6) {
+        std::snprintf(buffer, sizeof buffer, "%.2fus", ns / 1e3);
+    } else {
+        std::snprintf(buffer, sizeof buffer, "%.2fms", ns / 1e6);
+    }
+    return buffer;
+}
+
+// Each workload builds a fresh book, pre-generates its operation stream so no
+// random number generation lands inside a timed region, and hands the caller a
+// closure that applies operation i. It runs once per measurement pass.
+template <typename Workload>
+void report(const char* name, const Workload& workload, double resolution) {
+    double seconds = 0;
+    workload(kOps, [&](auto&& apply) {
+        const auto start = Clock::now();
+        for (std::size_t i = 0; i < kOps; ++i) apply(i);
+        seconds = nanos(Clock::now() - start) / 1e9;
+    });
+    const double mean = seconds * 1e9 / static_cast<double>(kOps);
+
+    std::vector<double> samples;
+    workload(kOps, [&](auto&& apply) {
+        samples.reserve(kOps / kBatch);
+        for (std::size_t i = 0; i + kBatch <= kOps; i += kBatch) {
+            const auto start = Clock::now();
+            for (std::size_t j = 0; j < kBatch; ++j) apply(i + j);
+            samples.push_back(nanos(Clock::now() - start) / kBatch);
+        }
+    });
+
+    // Per-operation timing is only trustworthy far above the tick, so this pass
+    // reports outliers and nothing else.
+    const double threshold = std::max(20 * mean, 4 * resolution);
+    double worst = 0;
+    std::size_t stalls = 0;
+    workload(kOps, [&](auto&& apply) {
+        for (std::size_t i = 0; i < kOps; ++i) {
+            const auto start = Clock::now();
+            apply(i);
+            const double elapsed = nanos(Clock::now() - start);
+            if (elapsed > threshold) ++stalls;
+            worst = std::max(worst, elapsed);
+        }
+    });
+
+    const Stats s = percentiles(samples);
+    std::printf("  %-18s %8.1fM/s %9s %9s %9s %9s %9s %8zu\n", name,
+                static_cast<double>(kOps) / seconds / 1e6, scaled(mean).c_str(),
+                scaled(s.p50).c_str(), scaled(s.p99).c_str(), scaled(s.p999).c_str(),
+                scaled(worst).c_str(), stalls);
 }
 
 }  // namespace
 
 int main() {
-    constexpr std::size_t kOps = 1'000'000;
-    std::printf("matchbook benchmark, %zu operations each\n\n", kOps);
+    const double resolution = tick();
 
-    {
-        OrderBook book{[](const Event&) {}, kOps};
+    const auto submit_resting = [](std::size_t ops, auto&& body) {
+        OrderBook book{[](const Event&) {}, ops};
         std::mt19937_64 rng(1);
-        std::vector<double> latencies;
-        latencies.reserve(kOps);
-        const auto start = Clock::now();
-        for (std::size_t i = 0; i < kOps; ++i) {
-            NewOrder order{i + 1, (rng() % 2) ? Side::Buy : Side::Sell, OrderType::Limit,
-                           TimeInForce::GTC, static_cast<Price>(1000 + rng() % 200),
-                           static_cast<Quantity>(1 + rng() % 100)};
-            const auto t0 = Clock::now();
-            book.submit(order);
-            latencies.push_back(
-                std::chrono::duration<double, std::nano>(Clock::now() - t0).count());
+        std::vector<NewOrder> orders;
+        orders.reserve(ops);
+        for (std::size_t i = 0; i < ops; ++i) {
+            const bool buy = rng() % 2 == 0;
+            const auto price = static_cast<Price>(buy ? 1000 + rng() % 100 : 1100 + rng() % 100);
+            orders.push_back({i + 1, buy ? Side::Buy : Side::Sell, OrderType::Limit,
+                              TimeInForce::GTC, price, static_cast<Quantity>(1 + rng() % 100)});
         }
-        const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
-        report("submit (mixed)", latencies, seconds, kOps);
-    }
+        body([&](std::size_t i) { book.submit(orders[i]); });
+    };
 
-    {
-        OrderBook book{[](const Event&) {}, kOps};
-        std::mt19937_64 rng(2);
-        std::vector<OrderId> resting;
-        resting.reserve(kOps);
-        for (std::size_t i = 0; i < kOps; ++i) {
-            const OrderId id = i + 1;
-            book.submit({id, Side::Buy, OrderType::Limit, TimeInForce::GTC,
-                         static_cast<Price>(1000 + rng() % 200),
-                         static_cast<Quantity>(1 + rng() % 100)});
-            resting.push_back(id);
-        }
-        std::shuffle(resting.begin(), resting.end(), rng);
-        std::vector<double> latencies;
-        latencies.reserve(resting.size());
-        const auto start = Clock::now();
-        for (const OrderId id : resting) {
-            const auto t0 = Clock::now();
-            book.cancel(id);
-            latencies.push_back(
-                std::chrono::duration<double, std::nano>(Clock::now() - t0).count());
-        }
-        const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
-        report("cancel (random)", latencies, seconds, resting.size());
-    }
-
-    {
-        OrderBook book{[](const Event&) {}, kOps * 2};
+    const auto submit_crossing = [](std::size_t ops, auto&& body) {
+        OrderBook book{[](const Event&) {}, ops * 2};
         std::mt19937_64 rng(3);
-        for (std::size_t i = 0; i < kOps; ++i)
+        for (std::size_t i = 0; i < ops; ++i)
             book.submit({i + 1, Side::Sell, OrderType::Limit, TimeInForce::GTC,
                          static_cast<Price>(1000 + rng() % 50), 10});
-        std::vector<double> latencies;
-        latencies.reserve(kOps);
-        const auto start = Clock::now();
-        for (std::size_t i = 0; i < kOps; ++i) {
-            const auto t0 = Clock::now();
-            book.submit({kOps + i + 1, Side::Buy, OrderType::Limit, TimeInForce::IOC, 1100, 10});
-            latencies.push_back(
-                std::chrono::duration<double, std::nano>(Clock::now() - t0).count());
-        }
-        const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
-        report("submit (crossing)", latencies, seconds, kOps);
-    }
+        body([&](std::size_t i) {
+            book.submit({ops + i + 1, Side::Buy, OrderType::Limit, TimeInForce::IOC, 1100, 10});
+        });
+    };
 
+    const auto cancel_random = [](std::size_t ops, auto&& body) {
+        OrderBook book{[](const Event&) {}, ops};
+        std::mt19937_64 rng(2);
+        std::vector<OrderId> ids;
+        ids.reserve(ops);
+        for (std::size_t i = 0; i < ops; ++i) {
+            book.submit({i + 1, Side::Buy, OrderType::Limit, TimeInForce::GTC,
+                         static_cast<Price>(1000 + rng() % 200),
+                         static_cast<Quantity>(1 + rng() % 100)});
+            ids.push_back(i + 1);
+        }
+        std::shuffle(ids.begin(), ids.end(), rng);
+        body([&](std::size_t i) { book.cancel(ids[i]); });
+    };
+
+    std::printf("matchbook benchmark, %zu operations per case\n\n", kOps);
+    std::printf("  clock          steady_clock, %.1fns tick\n", resolution);
+    std::printf("  throughput     one clock read per run, not per operation\n");
+    std::printf("  distribution   batches of %zu, putting the tick at %.2fns per operation\n",
+                kBatch, resolution / kBatch);
+    std::printf("  stalls         one clock read per operation, counting past 20x the mean\n\n");
+    std::printf("  %-18s %12s %9s %9s %9s %9s %9s %8s\n", "operation", "throughput", "mean", "p50",
+                "p99", "p99.9", "worst", "stalls");
+
+    report("submit resting", submit_resting, resolution);
+    report("submit crossing", submit_crossing, resolution);
+    report("cancel random", cancel_random, resolution);
     return 0;
 }
