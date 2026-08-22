@@ -115,9 +115,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           case "${{ needs.test.result }}" in
-            success)   state=success; text="Lint and tests passed" ;;
+            success)   state=success; text="Build, tests and sanitizers passed" ;;
             cancelled) state=error;   text="Run was cancelled" ;;
-            *)         state=failure; text="Lint or tests failed" ;;
+            *)         state=failure; text="Build, tests or sanitizers failed" ;;
           esac
           gh api -X POST "repos/${{ github.repository }}/statuses/${{ needs.authorize.outputs.sha }}" \
             -f state="$state" \

@@ -60,13 +60,26 @@ Divergence run_sequence(std::uint64_t seed, int operations) {
         } else if (!live.empty()) {
             const std::size_t which = rng() % live.size();
             const OrderId old_id = live[which];
-            live.erase(live.begin() + static_cast<long>(which));
-            const OrderId new_id = next_id++;
-            const auto price = static_cast<Price>(95 + rng() % 11);
-            const auto qty = static_cast<Quantity>(1 + rng() % 20);
-            fast.replace(old_id, new_id, price, qty);
-            slow.replace(old_id, new_id, price, qty);
-            live.push_back(new_id);
+            OrderId new_id = next_id++;
+            auto price = static_cast<Price>(95 + rng() % 11);
+            auto qty = static_cast<Quantity>(1 + rng() % 20);
+
+            // Valid fresh arguments never reach the rejection paths.
+            switch (static_cast<int>(rng() % 8)) {
+                case 0: qty = 0; break;
+                case 1: price = 0; break;
+                case 2: new_id = live[(which + 1) % live.size()]; break;
+                case 3: new_id = old_id; break;
+                default: break;
+            }
+
+            const bool accepted = fast.replace(old_id, new_id, price, qty);
+            if (slow.replace(old_id, new_id, price, qty) != accepted)
+                return {true, static_cast<std::size_t>(step), "replace return value diverged"};
+            if (accepted) {
+                live.erase(live.begin() + static_cast<long>(which));
+                live.push_back(new_id);
+            }
         }
 
         if (fast_log.log != slow_log.log) {
