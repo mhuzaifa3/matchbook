@@ -18,24 +18,34 @@ path, so a price either crosses or it does not, with no tolerance question.
 Supported: limit and market orders, GTC, IOC and FOK, cancel, and cancel-replace.
 Trades execute at the resting order's price, which honors the passive side's
 limit. A replace re-enters as a new order and loses time priority, which
-matches how exchanges treat a price or quantity change.
+matches how exchanges treat a price or quantity change. A replace carrying a
+price, quantity, or id the book refuses leaves the original order resting.
 
 ## Correctness
 
-Unit tests cover the behaviors individually. The differential test in
+Unit tests cover each behavior. The differential test in
 `tests/test_differential.cpp` runs random operation sequences through both the
-real book and a deliberately naive reference model in
-`tests/reference_book.hpp`, and compares the full event stream plus the depth at
-every price after every single operation.
+real book and a naive reference model in `tests/reference_book.hpp`, comparing
+the full event stream and the depth at every price after every operation. The
+reference is a flat vector scanned end to end for the best eligible order: far
+too slow to use, and correct by inspection, which is what makes it a useful
+oracle.
 
-The reference is a flat vector the test scans end to end for the best eligible
-order. It is far too slow to use, and correct by inspection, which is what makes
-it a useful oracle. The harness reports a divergence at the operation that
-caused it.
-
-Current coverage: 210 seeds, including ten sequences of 5,000 operations each,
-with zero divergences. Both suites also run clean under AddressSanitizer and
+Coverage is 210 seeds including ten sequences of 5,000 operations, with zero
+divergences. Both suites run clean under AddressSanitizer and
 UndefinedBehaviorSanitizer in CI.
+
+### What the oracle cannot catch
+
+A differential test tells you two implementations disagree. It says nothing
+about which one is right. Both books used to destroy a resting order before
+validating its replacement and then reject it, and they agreed at every step.
+The generator drew replace prices from 95 to 105 and quantities from 1 to 20, so
+it never asked for a replace the book should refuse.
+
+Fixing it took three changes: correct the reference, widen the generator, and
+write unit tests that state the rule. Only the last is independent of the
+oracle.
 
 ## Performance
 
@@ -47,47 +57,34 @@ Apple M3, single thread, release build, 1,000,000 operations per case:
 | submit, crossing | 8.6M ops/sec | 117ns | 115ns | 164ns | 309ns |
 | cancel, random order | 4.1M ops/sec | 243ns | 203ns | 273ns | 639ns |
 
+Run to run p50 holds within a few nanoseconds and throughput swings about 20%
+with the scheduler. The worst single operation lands between 18us and 70us,
+which on an unpinned laptop measures the operating system.
+
 ### Measuring below the clock
 
 `steady_clock` on Apple silicon reads the 24MHz timebase, so it advances in
-41.667ns steps. Two adjacent reads with nothing between them report 42ns. A
-submit costs about the same, so timing one operation at a time reports the
-clock.
-
-An earlier version of this benchmark did that, and every figure it printed
-landed on a multiple of 41.667ns: 42, 125, 208, 375, 458, 792. The 42ns p50 was
-one tick, which bounds the submit path somewhere between zero and 42ns and says
-nothing else. The tails carried a 42ns error, and each
-throughput figure included two clock reads per operation.
+41.667ns steps, and a submit costs about the same. An earlier version of this
+benchmark timed one operation at a time, so every figure it printed landed on a
+multiple of 41.667ns: 42, 125, 208, 375, 458, 792. The 42ns p50 was one tick.
 
 The benchmark now takes three passes over each workload:
 
-- **Throughput** reads the clock twice per run of a million operations.
-- **The distribution** times batches of 32 and divides, putting the tick at
-  1.3ns per operation. Batch means flatten an isolated spike without losing it.
-- **Stalls** time one operation at a time. Below a microsecond the tick swamps
-  the result; above one it stops mattering.
+- **Throughput** reads the clock twice per million operations.
+- **The distribution** times batches of 32, putting the tick at 1.3ns per
+  operation.
+- **Stalls** time single operations, which resolves only what runs for
+  microseconds.
 
-The order stream is generated up front, so no random number generation lands
-inside a timed region.
+Dropping the per-operation clock reads raised submit throughput from 12.2M to
+17.1M ops/sec and cut p99.9 from 1.04us to 129ns. That old tail was timer
+jitter.
 
-Run to run, p50 holds within a few nanoseconds. Throughput swings between 17M
-and 22M ops/sec on submit depending on the scheduler. The worst single
-operation lands between 18us and 70us, with an occasional 1.2ms on cancel. On an
-unpinned laptop that number measures the operating system, not the book.
-
-### What the numbers cost to get
-
-The first benchmark showed a 4.1ms worst case on submit. That was the order pool
-reallocating and the index rehashing as the book grew past a million resting
-orders, stalling one unlucky order while a million nodes were copied. The free
-list needed the same treatment for the cancel path.
-
-Pre-sizing both through the constructor's `expected_orders` parameter cuts p99
-from 156ns to 92ns and p99.9 from 630ns to 199ns, and removes the millisecond
-worst case. It leaves p50 alone, at 42ns either way. An earlier draft of this
-section claimed a median win of 83ns to 42ns, which was the clock rounding two
-ticks down to one.
+Pre-sizing the pool and index through the constructor's `expected_orders`
+parameter removed the real tail: p99.9 falls from 630ns to 199ns and a 4.1ms
+worst case disappears, while p50 sits at 42ns either way. An earlier draft of
+this section credited pre-sizing with a median win of 83ns to 42ns, which was
+the clock rounding two ticks to one.
 
 ## Build
 

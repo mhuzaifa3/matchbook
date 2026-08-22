@@ -216,6 +216,19 @@ bool OrderBook::replace(OrderId old_id, OrderId new_id, Price price, Quantity qu
         emit_rejected(old_id, RejectReason::UnknownOrderId);
         return false;
     }
+    // The resubmit below validates too late: by then the old order is gone.
+    if (quantity == 0) {
+        emit_rejected(old_id, RejectReason::ZeroQuantity);
+        return false;
+    }
+    if (price <= 0) {
+        emit_rejected(old_id, RejectReason::InvalidPrice);
+        return false;
+    }
+    if (new_id != old_id && index_.contains(new_id)) {
+        emit_rejected(old_id, RejectReason::DuplicateOrderId);
+        return false;
+    }
     const Node node = pool_[it->second];
     const std::uint32_t slot = it->second;
     unlink(node.side, node.price, slot);

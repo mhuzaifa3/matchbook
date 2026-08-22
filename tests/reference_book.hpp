@@ -67,6 +67,18 @@ public:
             reject(old_id, RejectReason::UnknownOrderId);
             return false;
         }
+        if (quantity == 0) {
+            reject(old_id, RejectReason::ZeroQuantity);
+            return false;
+        }
+        if (price <= 0) {
+            reject(old_id, RejectReason::InvalidPrice);
+            return false;
+        }
+        if (new_id != old_id && find(new_id) != nullptr) {
+            reject(old_id, RejectReason::DuplicateOrderId);
+            return false;
+        }
         const Side side = found->side;
         erase(old_id);
 

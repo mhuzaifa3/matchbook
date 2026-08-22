@@ -236,6 +236,48 @@ TEST(replace_of_unknown_id_is_rejected) {
     CHECK(f.recorder.back() == "REJ 9 1");
 }
 
+TEST(replace_with_zero_quantity_leaves_the_original_resting) {
+    Fixture f;
+    f.book.submit(limit(1, Side::Buy, 100, 5));
+    f.recorder.clear();
+    CHECK(!f.book.replace(1, 2, 100, 0));
+    CHECK(f.recorder.back() == "REJ 1 2");
+    CHECK_EQ(f.recorder.log.size(), 1u);
+    CHECK_EQ(f.book.resting_orders(), 1u);
+    CHECK_EQ(f.book.quantity_at(Side::Buy, 100), 5u);
+}
+
+TEST(replace_to_non_positive_price_leaves_the_original_resting) {
+    Fixture f;
+    f.book.submit(limit(1, Side::Buy, 100, 5));
+    f.recorder.clear();
+    CHECK(!f.book.replace(1, 2, 0, 5));
+    CHECK(f.recorder.back() == "REJ 1 3");
+    CHECK_EQ(f.book.resting_orders(), 1u);
+    CHECK_EQ(f.book.quantity_at(Side::Buy, 100), 5u);
+}
+
+TEST(replace_onto_a_live_id_leaves_both_orders_resting) {
+    Fixture f;
+    f.book.submit(limit(1, Side::Buy, 100, 5));
+    f.book.submit(limit(2, Side::Buy, 99, 7));
+    f.recorder.clear();
+    CHECK(!f.book.replace(1, 2, 98, 5));
+    CHECK(f.recorder.back() == "REJ 1 0");
+    CHECK_EQ(f.book.resting_orders(), 2u);
+    CHECK_EQ(f.book.quantity_at(Side::Buy, 100), 5u);
+    CHECK_EQ(f.book.quantity_at(Side::Buy, 99), 7u);
+}
+
+TEST(replace_may_keep_the_same_order_id) {
+    Fixture f;
+    f.book.submit(limit(1, Side::Buy, 100, 5));
+    CHECK(f.book.replace(1, 1, 101, 7));
+    CHECK_EQ(f.book.resting_orders(), 1u);
+    CHECK_EQ(f.book.best_bid().value(), 101);
+    CHECK_EQ(f.book.quantity_at(Side::Buy, 101), 7u);
+}
+
 TEST(level_is_removed_once_emptied) {
     Fixture f;
     f.book.submit(limit(1, Side::Buy, 100, 5));
