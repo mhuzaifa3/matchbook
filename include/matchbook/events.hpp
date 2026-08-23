@@ -14,6 +14,7 @@ enum class RejectReason : std::uint8_t {
     InvalidPrice,
     FillOrKillUnfillable,
     MarketOrderNoLiquidity,
+    PriceOutsideBand,
 };
 
 struct Accepted {

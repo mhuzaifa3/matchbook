@@ -1,3 +1,5 @@
+#include <stdexcept>
+
 #include "harness.hpp"
 #include "matchbook/order_book.hpp"
 #include "recorder.hpp"
@@ -16,9 +18,11 @@ NewOrder market(OrderId id, Side side, Quantity qty, TimeInForce tif = TimeInFor
     return NewOrder{id, side, OrderType::Market, tif, 0, qty};
 }
 
+constexpr OrderBook::PriceBand kBand{1, 4096};
+
 struct Fixture {
     Recorder recorder;
-    OrderBook book{[this](const Event& e) { recorder(e); }};
+    OrderBook book{[this](const Event& e) { recorder(e); }, kBand};
 };
 
 }  // namespace
@@ -276,6 +280,62 @@ TEST(replace_may_keep_the_same_order_id) {
     CHECK_EQ(f.book.resting_orders(), 1u);
     CHECK_EQ(f.book.best_bid().value(), 101);
     CHECK_EQ(f.book.quantity_at(Side::Buy, 101), 7u);
+}
+
+TEST(a_price_above_the_band_is_rejected) {
+    Recorder recorder;
+    OrderBook book{[&](const Event& e) { recorder(e); }, {100, 200}};
+    book.submit(limit(1, Side::Buy, 201, 5));
+    CHECK(recorder.back() == "REJ 1 6");
+    CHECK_EQ(book.resting_orders(), 0u);
+}
+
+TEST(a_price_below_the_band_is_rejected) {
+    Recorder recorder;
+    OrderBook book{[&](const Event& e) { recorder(e); }, {100, 200}};
+    book.submit(limit(1, Side::Sell, 99, 5));
+    CHECK(recorder.back() == "REJ 1 6");
+    CHECK_EQ(book.resting_orders(), 0u);
+}
+
+TEST(the_band_edges_are_tradable) {
+    Recorder recorder;
+    OrderBook book{[&](const Event& e) { recorder(e); }, {100, 200}};
+    book.submit(limit(1, Side::Buy, 100, 5));
+    book.submit(limit(2, Side::Sell, 200, 5));
+    CHECK_EQ(book.best_bid().value(), 100);
+    CHECK_EQ(book.best_ask().value(), 200);
+    CHECK_EQ(book.resting_orders(), 2u);
+}
+
+TEST(a_market_order_is_not_band_checked) {
+    Recorder recorder;
+    OrderBook book{[&](const Event& e) { recorder(e); }, {100, 200}};
+    book.submit(limit(1, Side::Sell, 150, 5));
+    recorder.clear();
+    book.submit(market(2, Side::Buy, 5));
+    CHECK(recorder.log[1] == "TRD 2 1 150 5");
+}
+
+TEST(replace_outside_the_band_leaves_the_original_resting) {
+    Recorder recorder;
+    OrderBook book{[&](const Event& e) { recorder(e); }, {100, 200}};
+    book.submit(limit(1, Side::Buy, 150, 5));
+    recorder.clear();
+    CHECK(!book.replace(1, 2, 201, 5));
+    CHECK(recorder.back() == "REJ 1 6");
+    CHECK_EQ(book.resting_orders(), 1u);
+    CHECK_EQ(book.quantity_at(Side::Buy, 150), 5u);
+}
+
+TEST(an_inverted_band_is_rejected_at_construction) {
+    bool threw = false;
+    try {
+        const OrderBook book{[](const Event&) {}, {200, 100}};
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
 }
 
 TEST(level_is_removed_once_emptied) {

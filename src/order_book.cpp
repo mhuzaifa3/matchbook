@@ -1,11 +1,28 @@
 #include "matchbook/order_book.hpp"
 
 #include <algorithm>
+#include <stdexcept>
 #include <utility>
 
 namespace matchbook {
 
-OrderBook::OrderBook(EventSink sink, std::size_t expected_orders) : sink_(std::move(sink)) {
+namespace {
+
+// The ladders are sized from the band in the member init list, so the band has
+// to be checked before that runs or an inverted band allocates a huge vector.
+std::size_t checked_ticks(OrderBook::PriceBand band) {
+    if (band.min > band.max) throw std::invalid_argument("price band is inverted");
+    if (band.ticks() > Occupancy::max_ticks) throw std::invalid_argument("price band is too wide");
+    return band.ticks();
+}
+
+}  // namespace
+
+OrderBook::OrderBook(EventSink sink, PriceBand band, std::size_t expected_orders)
+    : sink_(std::move(sink)),
+      band_(band),
+      bids_(checked_ticks(band)),
+      asks_(checked_ticks(band)) {
     pool_.reserve(expected_orders);
     free_slots_.reserve(expected_orders);
     index_.reserve(expected_orders);
@@ -63,28 +80,36 @@ bool OrderBook::crosses(Side taker, OrderType type, Price limit, Price resting) 
 }
 
 Quantity OrderBook::fillable(Side side, OrderType type, Price limit) const {
+    const Ladder& book = ladder(opposite(side));
+    const bool ascending = side == Side::Buy;
     Quantity total = 0;
-    if (side == Side::Buy) {
-        for (const auto& [price, level] : asks_) {
-            if (!crosses(side, type, limit, price)) break;
-            total += level.total;
-        }
-    } else {
-        for (const auto& [price, level] : bids_) {
-            if (!crosses(side, type, limit, price)) break;
-            total += level.total;
-        }
+    std::size_t at = ascending ? book.occupied.lowest() : book.occupied.highest();
+    while (at != Occupancy::npos) {
+        if (!crosses(side, type, limit, price_at(at))) break;
+        total += book.levels[at].total;
+        at = ascending ? book.occupied.next_above(at) : book.occupied.next_below(at);
     }
     return total;
 }
 
-template <typename Ladder>
-Quantity OrderBook::match(Ladder& ladder, const NewOrder& order, Quantity remaining) {
-    while (remaining > 0 && !ladder.empty()) {
-        auto best = ladder.begin();
-        if (!crosses(order.side, order.type, order.price, best->first)) break;
+std::optional<RejectReason> OrderBook::price_rejection(OrderType type, Price price) const {
+    if (type != OrderType::Limit) return std::nullopt;
+    if (price <= 0) return RejectReason::InvalidPrice;
+    if (!band_.contains(price)) return RejectReason::PriceOutsideBand;
+    return std::nullopt;
+}
 
-        Level& level = best->second;
+Quantity OrderBook::match(const NewOrder& order, Quantity remaining) {
+    Ladder& book = ladder(opposite(order.side));
+    const bool ascending = order.side == Side::Buy;
+
+    while (remaining > 0) {
+        const std::size_t best = ascending ? book.occupied.lowest() : book.occupied.highest();
+        if (best == Occupancy::npos) break;
+        const Price price = price_at(best);
+        if (!crosses(order.side, order.type, order.price, price)) break;
+
+        Level& level = book.levels[best];
         while (remaining > 0 && level.head != npos) {
             Node& maker = pool_[level.head];
             const Quantity traded = std::min(remaining, maker.remaining);
@@ -92,7 +117,7 @@ Quantity OrderBook::match(Ladder& ladder, const NewOrder& order, Quantity remain
             maker.remaining -= traded;
             remaining -= traded;
             level.total -= traded;
-            emit_trade(order.id, maker.id, order.side, best->first, traded);
+            emit_trade(order.id, maker.id, order.side, price, traded);
 
             if (maker.remaining == 0) {
                 const std::uint32_t slot = level.head;
@@ -106,30 +131,29 @@ Quantity OrderBook::match(Ladder& ladder, const NewOrder& order, Quantity remain
                 release(slot);
             }
         }
-        if (level.head == npos) ladder.erase(best);
+        if (level.head == npos) book.occupied.clear(best);
     }
     return remaining;
 }
 
 void OrderBook::rest(const NewOrder& order, Quantity remaining) {
-    const std::uint32_t slot = acquire(Node{order.id, order.side, order.price, remaining, npos, npos});
+    const std::uint32_t slot =
+        acquire(Node{order.id, order.side, order.price, remaining, npos, npos});
     index_.emplace(order.id, slot);
 
-    Level* level = nullptr;
-    if (order.side == Side::Buy) {
-        level = &bids_[order.price];
-    } else {
-        level = &asks_[order.price];
-    }
+    Ladder& book = ladder(order.side);
+    const std::size_t at = index_of(order.price);
+    Level& level = book.levels[at];
 
-    if (level->tail == npos) {
-        level->head = level->tail = slot;
+    if (level.tail == npos) {
+        level.head = level.tail = slot;
+        book.occupied.set(at);
     } else {
-        pool_[level->tail].next = slot;
-        pool_[slot].prev = level->tail;
-        level->tail = slot;
+        pool_[level.tail].next = slot;
+        pool_[slot].prev = level.tail;
+        level.tail = slot;
     }
-    level->total += remaining;
+    level.total += remaining;
 }
 
 void OrderBook::submit(const NewOrder& order) {
@@ -141,8 +165,8 @@ void OrderBook::submit(const NewOrder& order) {
         emit_rejected(order.id, RejectReason::DuplicateOrderId);
         return;
     }
-    if (order.type == OrderType::Limit && order.price <= 0) {
-        emit_rejected(order.id, RejectReason::InvalidPrice);
+    if (const auto reason = price_rejection(order.type, order.price)) {
+        emit_rejected(order.id, *reason);
         return;
     }
     if (order.tif == TimeInForce::FOK &&
@@ -150,7 +174,7 @@ void OrderBook::submit(const NewOrder& order) {
         emit_rejected(order.id, RejectReason::FillOrKillUnfillable);
         return;
     }
-    const bool no_liquidity = order.side == Side::Buy ? asks_.empty() : bids_.empty();
+    const bool no_liquidity = ladder(opposite(order.side)).occupied.empty();
     if (order.type == OrderType::Market && no_liquidity) {
         emit_rejected(order.id, RejectReason::MarketOrderNoLiquidity);
         return;
@@ -158,8 +182,7 @@ void OrderBook::submit(const NewOrder& order) {
 
     emit_accepted(order);
 
-    const Quantity remaining = order.side == Side::Buy ? match(asks_, order, order.quantity)
-                                                       : match(bids_, order, order.quantity);
+    const Quantity remaining = match(order, order.quantity);
     if (remaining == 0) return;
 
     if (order.type == OrderType::Limit && order.tif == TimeInForce::GTC) {
@@ -170,29 +193,23 @@ void OrderBook::submit(const NewOrder& order) {
 }
 
 void OrderBook::unlink(Side side, Price price, std::uint32_t slot) {
+    Ladder& book = ladder(side);
+    const std::size_t at = index_of(price);
+    Level& level = book.levels[at];
     Node& node = pool_[slot];
-    auto detach = [&](auto& ladder) {
-        auto it = ladder.find(price);
-        if (it == ladder.end()) return;
-        Level& level = it->second;
-        if (node.prev != npos) {
-            pool_[node.prev].next = node.next;
-        } else {
-            level.head = node.next;
-        }
-        if (node.next != npos) {
-            pool_[node.next].prev = node.prev;
-        } else {
-            level.tail = node.prev;
-        }
-        level.total -= node.remaining;
-        if (level.head == npos) ladder.erase(it);
-    };
-    if (side == Side::Buy) {
-        detach(bids_);
+
+    if (node.prev != npos) {
+        pool_[node.prev].next = node.next;
     } else {
-        detach(asks_);
+        level.head = node.next;
     }
+    if (node.next != npos) {
+        pool_[node.next].prev = node.prev;
+    } else {
+        level.tail = node.prev;
+    }
+    level.total -= node.remaining;
+    if (level.head == npos) book.occupied.clear(at);
 }
 
 bool OrderBook::cancel(OrderId id) {
@@ -217,20 +234,22 @@ bool OrderBook::replace(OrderId old_id, OrderId new_id, Price price, Quantity qu
         return false;
     }
     // The resubmit below validates too late: by then the old order is gone.
+    // Same order of checks as submit, so both reject for the same reason.
     if (quantity == 0) {
         emit_rejected(old_id, RejectReason::ZeroQuantity);
-        return false;
-    }
-    if (price <= 0) {
-        emit_rejected(old_id, RejectReason::InvalidPrice);
         return false;
     }
     if (new_id != old_id && index_.contains(new_id)) {
         emit_rejected(old_id, RejectReason::DuplicateOrderId);
         return false;
     }
-    const Node node = pool_[it->second];
+    if (const auto reason = price_rejection(OrderType::Limit, price)) {
+        emit_rejected(old_id, *reason);
+        return false;
+    }
+
     const std::uint32_t slot = it->second;
+    const Node node = pool_[slot];
     unlink(node.side, node.price, slot);
     index_.erase(it);
     release(slot);
@@ -247,22 +266,20 @@ bool OrderBook::replace(OrderId old_id, OrderId new_id, Price price, Quantity qu
 }
 
 std::optional<Price> OrderBook::best_bid() const {
-    if (bids_.empty()) return std::nullopt;
-    return bids_.begin()->first;
+    const std::size_t at = bids_.occupied.highest();
+    if (at == Occupancy::npos) return std::nullopt;
+    return price_at(at);
 }
 
 std::optional<Price> OrderBook::best_ask() const {
-    if (asks_.empty()) return std::nullopt;
-    return asks_.begin()->first;
+    const std::size_t at = asks_.occupied.lowest();
+    if (at == Occupancy::npos) return std::nullopt;
+    return price_at(at);
 }
 
 Quantity OrderBook::quantity_at(Side side, Price price) const {
-    if (side == Side::Buy) {
-        auto it = bids_.find(price);
-        return it == bids_.end() ? 0 : it->second.total;
-    }
-    auto it = asks_.find(price);
-    return it == asks_.end() ? 0 : it->second.total;
+    if (!band_.contains(price)) return 0;
+    return ladder(side).levels[index_of(price)].total;
 }
 
 }  // namespace matchbook
