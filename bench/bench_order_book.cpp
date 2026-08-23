@@ -14,6 +14,7 @@ namespace {
 
 constexpr std::size_t kOps = 1'000'000;
 constexpr std::size_t kBatch = 32;
+constexpr OrderBook::PriceBand kBand{1, 4096};
 
 double nanos(Clock::duration d) { return std::chrono::duration<double, std::nano>(d).count(); }
 
@@ -107,7 +108,7 @@ int main() {
     const double resolution = tick();
 
     const auto submit_resting = [](std::size_t ops, auto&& body) {
-        OrderBook book{[](const Event&) {}, ops};
+        OrderBook book{[](const Event&) {}, kBand, ops};
         std::mt19937_64 rng(1);
         std::vector<NewOrder> orders;
         orders.reserve(ops);
@@ -121,7 +122,7 @@ int main() {
     };
 
     const auto submit_crossing = [](std::size_t ops, auto&& body) {
-        OrderBook book{[](const Event&) {}, ops * 2};
+        OrderBook book{[](const Event&) {}, kBand, ops * 2};
         std::mt19937_64 rng(3);
         for (std::size_t i = 0; i < ops; ++i)
             book.submit({i + 1, Side::Sell, OrderType::Limit, TimeInForce::GTC,
@@ -132,7 +133,7 @@ int main() {
     };
 
     const auto cancel_random = [](std::size_t ops, auto&& body) {
-        OrderBook book{[](const Event&) {}, ops};
+        OrderBook book{[](const Event&) {}, kBand, ops};
         std::mt19937_64 rng(2);
         std::vector<OrderId> ids;
         ids.reserve(ops);

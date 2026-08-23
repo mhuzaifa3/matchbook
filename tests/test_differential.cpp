@@ -25,8 +25,9 @@ struct Divergence {
 Divergence run_sequence(std::uint64_t seed, int operations) {
     Recorder fast_log;
     Recorder slow_log;
-    OrderBook fast{[&](const Event& e) { fast_log(e); }};
-    ReferenceBook slow{[&](const Event& e) { slow_log(e); }};
+    constexpr Price kBandMin = 90, kBandMax = 110;
+    OrderBook fast{[&](const Event& e) { fast_log(e); }, {kBandMin, kBandMax}};
+    ReferenceBook slow{[&](const Event& e) { slow_log(e); }, kBandMin, kBandMax};
 
     std::mt19937_64 rng(seed);
     std::vector<OrderId> live;
@@ -43,9 +44,18 @@ Divergence run_sequence(std::uint64_t seed, int operations) {
             order.type = kind < 8 ? OrderType::Limit : OrderType::Market;
             const int tif = static_cast<int>(rng() % 10);
             order.tif = tif < 7 ? TimeInForce::GTC : (tif < 9 ? TimeInForce::IOC : TimeInForce::FOK);
-            order.price = static_cast<Price>(95 + rng() % 11);
+            order.price = static_cast<Price>(88 + rng() % 26);
             order.quantity = static_cast<Quantity>(1 + rng() % 20);
             if (order.type == OrderType::Market) order.price = 0;
+
+            // Prices run past both edges of the band, and one submission in
+            // eight is malformed, so every rejection path runs in sequence.
+            switch (static_cast<int>(rng() % 8)) {
+                case 0: order.quantity = 0; break;
+                case 1: if (!live.empty()) order.id = live[rng() % live.size()]; break;
+                case 2: order.type = OrderType::Limit, order.price = 0; break;
+                default: break;
+            }
 
             fast.submit(order);
             slow.submit(order);
@@ -61,7 +71,7 @@ Divergence run_sequence(std::uint64_t seed, int operations) {
             const std::size_t which = rng() % live.size();
             const OrderId old_id = live[which];
             OrderId new_id = next_id++;
-            auto price = static_cast<Price>(95 + rng() % 11);
+            auto price = static_cast<Price>(88 + rng() % 26);
             auto qty = static_cast<Quantity>(1 + rng() % 20);
 
             // Valid fresh arguments never reach the rejection paths.
@@ -97,7 +107,7 @@ Divergence run_sequence(std::uint64_t seed, int operations) {
             fast.resting_orders() != slow.resting_orders())
             return {true, static_cast<std::size_t>(step), "book state diverged"};
 
-        for (Price price = 95; price <= 105; ++price) {
+        for (Price price = kBandMin - 2; price <= kBandMax + 2; ++price) {
             if (fast.quantity_at(Side::Buy, price) != slow.quantity_at(Side::Buy, price) ||
                 fast.quantity_at(Side::Sell, price) != slow.quantity_at(Side::Sell, price))
                 return {true, static_cast<std::size_t>(step),

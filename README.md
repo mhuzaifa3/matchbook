@@ -7,13 +7,27 @@ differential testing against a reference implementation, and measured latency.
 
 | Concern | Approach | Cost |
 |---|---|---|
-| Price levels | `std::map` per side, ordered so `begin()` is always the best price | O(log P) to reach a new level, O(1) for the best |
+| Price levels | Flat array per side, indexed by tick | O(1) to reach any level |
+| Best price | Three-level occupancy bitmap, scanned with `countr_zero` | O(1), three dependent loads |
 | Orders within a level | Intrusive doubly-linked FIFO over a pre-allocated pool | O(1) append, O(1) unlink |
 | Order lookup | `unordered_map<OrderId, slot>` | O(1) cancel and replace |
 | Allocation | Free-list over a pre-sized pool, no per-order `new` | no allocation on the hot path |
 
 Prices are integer ticks. There is no floating point anywhere in the matching
 path, so a price either crosses or it does not, with no tolerance question.
+
+A flat ladder reaches a known price for free but leaves open which price is
+best. The book stacks three bitmaps to answer that: one bit per tick, one bit
+per word of those, one per word again. A 262,144-tick band summarizes down to a
+single word, so the best bid costs three loads and three bit scans, and the best
+ask costs the same in the other direction. Cancel is what this buys: reaching
+the level is arithmetic, unlinking from the FIFO is two pointer writes, and
+clearing the tick touches at most three words, so nothing searches.
+
+Bounding the band is the tradeoff. Venues bound prices anyway, through price
+banding at CME or limit-up limit-down in US equities, so the book rejects an
+order priced outside its band with `PriceOutsideBand`. A 65,536-tick band costs
+2MB of levels and 16KB of bitmap.
 
 Supported: limit and market orders, GTC, IOC and FOK, cancel, and cancel-replace.
 Trades execute at the resting order's price, which honors the passive side's
@@ -23,7 +37,9 @@ price, quantity, or id the book refuses leaves the original order resting.
 
 ## Correctness
 
-Unit tests cover each behavior. The differential test in
+Unit tests cover each behavior, and the occupancy bitmap has its own randomized
+test against `std::set`, since a wrong answer there corrupts the best price
+without tripping anything else. The differential test in
 `tests/test_differential.cpp` runs random operation sequences through both the
 real book and a naive reference model in `tests/reference_book.hpp`, comparing
 the full event stream and the depth at every price after every operation. The
@@ -53,19 +69,28 @@ Apple M3, single thread, release build, 1,000,000 operations per case:
 
 | Operation | Throughput | mean | p50 | p99 | p99.9 |
 |---|---|---|---|---|---|
-| submit, resting | 17.1M ops/sec | 59ns | 40ns | 74ns | 129ns |
-| submit, crossing | 8.6M ops/sec | 117ns | 115ns | 164ns | 309ns |
-| cancel, random order | 4.1M ops/sec | 243ns | 203ns | 273ns | 639ns |
+| submit, resting | 27.6M ops/sec | 36ns | 22ns | 52ns | 113ns |
+| submit, crossing | 7.7M ops/sec | 130ns | 112ns | 204ns | 411ns |
+| cancel, random order | 5.8M ops/sec | 172ns | 174ns | 234ns | 460ns |
 
-Run to run p50 holds within a few nanoseconds and throughput swings about 20%
-with the scheduler. The worst single operation lands between 18us and 70us,
-which on an unpinned laptop measures the operating system.
+The table reports the slowest of three runs. p50 holds within a nanosecond or
+two across runs while resting-submit throughput ranges up to 38M ops/sec, and
+the worst single operation lands between 15us and 165us, which on an unpinned
+laptop measures the operating system.
+
+### What the ladder changed
+
+Replacing `std::map` with the tick ladder moved resting submits from 17.1M to
+28M ops/sec and cut p50 from 40ns to 22ns. Cancel gained less, 203ns to 174ns,
+because a random cancel at a million resting orders spends its time missing
+cache on the order pool, not finding the level. Crossing submits did not move:
+they walk the FIFO and emit trades, which the ladder never touches.
 
 ### Measuring below the clock
 
-`steady_clock` on Apple silicon reads the 24MHz timebase, so it advances in
-41.667ns steps, and a submit costs about the same. An earlier version of this
-benchmark timed one operation at a time, so every figure it printed landed on a
+That 22ns p50 sits below the clock. `steady_clock` on Apple silicon reads the
+24MHz timebase, so it advances in 41.667ns steps. An earlier version of this
+benchmark timed one operation at a time, and every figure it printed landed on a
 multiple of 41.667ns: 42, 125, 208, 375, 458, 792. The 42ns p50 was one tick.
 
 The benchmark now takes three passes over each workload:
@@ -76,14 +101,11 @@ The benchmark now takes three passes over each workload:
 - **Stalls** time single operations, which resolves only what runs for
   microseconds.
 
-Dropping the per-operation clock reads raised submit throughput from 12.2M to
-17.1M ops/sec and cut p99.9 from 1.04us to 129ns. That old tail was timer
-jitter.
-
-Pre-sizing the pool and index through the constructor's `expected_orders`
-parameter removed the real tail: p99.9 falls from 630ns to 199ns and a 4.1ms
-worst case disappears, while p50 sits at 42ns either way. An earlier draft of
-this section credited pre-sizing with a median win of 83ns to 42ns, which was
+Dropping the per-operation clock reads raised throughput from 12.2M to 17.1M
+ops/sec and cut p99.9 from 1.04us to 129ns, all of it timer jitter. Pre-sizing
+the pool and index through `expected_orders` removed the real tail, taking p99.9
+from 630ns to 199ns and deleting a 4.1ms worst case while leaving p50 alone. An
+earlier draft credited pre-sizing with a median win of 83ns to 42ns, which was
 the clock rounding two ticks to one.
 
 ## Build
@@ -106,9 +128,9 @@ Out of scope by choice:
   the whole system, not a lock to add to a book.
 - No self-trade prevention. A participant can trade with their own resting order.
 - No iceberg or stop orders, no auctions, no market-data snapshot recovery.
-- The book uses `std::map` for correctness at arbitrary prices. A ladder
-  indexed by tick would remove the O(log P) level lookup and is the obvious
-  next optimization for a bounded price band.
+- The band is fixed at construction. A venue that re-centers its band intraday
+  would need the ladder to slide underneath the resting orders, which this
+  does not do.
 
 ## License
 

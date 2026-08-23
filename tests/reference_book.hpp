@@ -16,13 +16,16 @@ namespace matchbook::testing {
 // real book is differentially tested against.
 class ReferenceBook {
 public:
-    explicit ReferenceBook(EventSink sink) : sink_(std::move(sink)) {}
+    ReferenceBook(EventSink sink, Price band_min, Price band_max)
+        : sink_(std::move(sink)), band_min_(band_min), band_max_(band_max) {}
 
     void submit(const NewOrder& order) {
         if (order.quantity == 0) return reject(order.id, RejectReason::ZeroQuantity);
         if (find(order.id) != nullptr) return reject(order.id, RejectReason::DuplicateOrderId);
         if (order.type == OrderType::Limit && order.price <= 0)
             return reject(order.id, RejectReason::InvalidPrice);
+        if (order.type == OrderType::Limit && !in_band(order.price))
+            return reject(order.id, RejectReason::PriceOutsideBand);
         if (order.tif == TimeInForce::FOK && fillable(order) < order.quantity)
             return reject(order.id, RejectReason::FillOrKillUnfillable);
         if (order.type == OrderType::Market && !has_any(opposite(order.side)))
@@ -71,12 +74,16 @@ public:
             reject(old_id, RejectReason::ZeroQuantity);
             return false;
         }
+        if (new_id != old_id && find(new_id) != nullptr) {
+            reject(old_id, RejectReason::DuplicateOrderId);
+            return false;
+        }
         if (price <= 0) {
             reject(old_id, RejectReason::InvalidPrice);
             return false;
         }
-        if (new_id != old_id && find(new_id) != nullptr) {
-            reject(old_id, RejectReason::DuplicateOrderId);
+        if (!in_band(price)) {
+            reject(old_id, RejectReason::PriceOutsideBand);
             return false;
         }
         const Side side = found->side;
@@ -96,6 +103,7 @@ public:
     [[nodiscard]] std::optional<Price> best_ask() const { return best_price(Side::Sell); }
 
     [[nodiscard]] Quantity quantity_at(Side side, Price price) const {
+        if (!in_band(price)) return 0;
         Quantity total = 0;
         for (const auto& order : resting_)
             if (order.side == side && order.price == price) total += order.remaining;
@@ -105,6 +113,10 @@ public:
     [[nodiscard]] std::size_t resting_orders() const { return resting_.size(); }
 
 private:
+    [[nodiscard]] bool in_band(Price price) const {
+        return price >= band_min_ && price <= band_max_;
+    }
+
     struct Resting {
         OrderId id;
         Side side;
@@ -204,6 +216,8 @@ private:
     }
 
     EventSink sink_;
+    Price band_min_{};
+    Price band_max_{};
     std::vector<Resting> resting_;
     std::uint64_t next_seq_{0};
     Sequence sequence_{0};

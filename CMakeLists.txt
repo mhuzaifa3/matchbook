@@ -19,6 +19,10 @@ add_executable(test_order_book tests/test_order_book.cpp)
 target_link_libraries(test_order_book PRIVATE matchbook)
 add_test(NAME order_book COMMAND test_order_book)
 
+add_executable(test_occupancy tests/test_occupancy.cpp)
+target_link_libraries(test_occupancy PRIVATE matchbook)
+add_test(NAME occupancy COMMAND test_occupancy)
+
 add_executable(test_differential tests/test_differential.cpp)
 target_link_libraries(test_differential PRIVATE matchbook)
 add_test(NAME differential COMMAND test_differential)
